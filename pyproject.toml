@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paperhere"
+version = "0.1.0"
+description = "LaTeX editing with bidirectional synctex support on nvim and zathura"
+requires-python = ">=3.10"
+
+[project.scripts]
+paperhere = "paperhere.cli:main"
