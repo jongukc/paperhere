@@ -30,6 +30,9 @@ let searchGeneration = 0;
 let lastSearch = "";
 const pageViewports = new Map();
 const measureContext = document.createElement("canvas").getContext("2d");
+const destinationCache = new Map();
+const backPositions = [];
+const forwardPositions = [];
 let pendingG = false;
 let pendingGTimer = null;
 let events = null;
@@ -110,16 +113,120 @@ async function renderPage(pdf, number, generation) {
   canvas.height = Math.floor(viewport.height * outputScale);
   canvas.style.width = `${viewport.width}px`;
   canvas.style.height = `${viewport.height}px`;
-  canvas.addEventListener("click", inverseSearch);
+  wrapper.addEventListener("click", inverseSearch);
   wrapper.append(canvas);
   viewer.append(wrapper);
   pageViewports.set(number, viewport);
   const context = canvas.getContext("2d", { alpha: false });
-  await page.render({
+  const rendering = page.render({
     canvasContext: context,
     viewport,
     transform: outputScale === 1 ? null : [outputScale, 0, 0, outputScale, 0, 0],
   }).promise;
+  // Links are a convenience; a broken annotation must not block the page.
+  const links = addLinks(pdf, page, wrapper, viewport).catch(() => {});
+  await rendering;
+  await links;
+}
+
+async function addLinks(pdf, page, wrapper, viewport) {
+  const annotations = await page.getAnnotations({ intent: "display" });
+  for (const annotation of annotations) {
+    if (annotation.subtype !== "Link" || !(annotation.url || annotation.dest)) continue;
+    const [x1, y1] = viewport.convertToViewportPoint(annotation.rect[0], annotation.rect[1]);
+    const [x2, y2] = viewport.convertToViewportPoint(annotation.rect[2], annotation.rect[3]);
+    const anchor = document.createElement("a");
+    anchor.className = "link";
+    anchor.style.left = `${Math.min(x1, x2)}px`;
+    anchor.style.top = `${Math.min(y1, y2)}px`;
+    anchor.style.width = `${Math.abs(x2 - x1)}px`;
+    anchor.style.height = `${Math.abs(y2 - y1)}px`;
+    if (annotation.url) {
+      anchor.href = annotation.url;
+      anchor.target = "_blank";
+      anchor.rel = "noopener noreferrer";
+      anchor.title = annotation.url;
+    } else {
+      anchor.href = "#";
+      if (typeof annotation.dest === "string") anchor.title = annotation.dest;
+      anchor.addEventListener("click", (event) => {
+        // Ctrl-click stays inverse SyncTeX; the page handler takes it.
+        if (event.ctrlKey) return;
+        event.preventDefault();
+        void followLink(pdf, annotation.dest);
+      });
+    }
+    wrapper.append(anchor);
+  }
+}
+
+async function resolveDestination(pdf, dest) {
+  const key = typeof dest === "string" ? dest : JSON.stringify(dest);
+  if (destinationCache.has(key)) return destinationCache.get(key);
+  const explicit = typeof dest === "string" ? await pdf.getDestination(dest) : dest;
+  let target = null;
+  if (Array.isArray(explicit) && explicit.length) {
+    const [ref, kind, ...args] = explicit;
+    const index = ref !== null && typeof ref === "object" ? await pdf.getPageIndex(ref) : Number(ref);
+    let top = null;
+    if (kind?.name === "XYZ") top = args[1];
+    else if (kind?.name === "FitH" || kind?.name === "FitBH") top = args[0];
+    else if (kind?.name === "FitR") top = args[3];
+    target = { page: index + 1, top: typeof top === "number" ? top : null };
+  }
+  destinationCache.set(key, target);
+  return target;
+}
+
+async function followLink(pdf, dest) {
+  if (pdf !== documentHandle) return;
+  try {
+    const target = await resolveDestination(pdf, dest);
+    if (!target) {
+      setStatus("Link target not found", true);
+      return;
+    }
+    backPositions.push(captureAnchor());
+    forwardPositions.length = 0;
+    scrollToDestination(target);
+    setStatus(`Page ${target.page} (Ctrl-o goes back)`);
+  } catch (error) {
+    setStatus(String(error?.message || error), true);
+  }
+}
+
+function scrollToDestination({ page: number, top }) {
+  const page = document.querySelector(`.page[data-page="${number}"]`);
+  const viewport = pageViewports.get(number);
+  if (!page || !viewport) {
+    scrollToPage(number);
+    return;
+  }
+  const offset = typeof top === "number" ? Math.max(0, viewport.convertToViewportPoint(0, top)[1]) : 0;
+  const pageTop = page.getBoundingClientRect().top + window.scrollY;
+  const toolbarBottom = document.querySelector("#toolbar").getBoundingClientRect().bottom;
+  window.scrollTo({ top: pageTop + offset - toolbarBottom - 8 });
+  pageNumber.value = String(number);
+}
+
+function goBack() {
+  if (!backPositions.length) {
+    setStatus("No earlier position");
+    return;
+  }
+  forwardPositions.push(captureAnchor());
+  restoreAnchor(backPositions.pop());
+  updateCurrentPage();
+}
+
+function goForward() {
+  if (!forwardPositions.length) {
+    setStatus("No later position");
+    return;
+  }
+  backPositions.push(captureAnchor());
+  restoreAnchor(forwardPositions.pop());
+  updateCurrentPage();
 }
 
 async function loadPdf(nextRevision = revision, preservePosition = true) {
@@ -144,6 +251,7 @@ async function loadPdf(nextRevision = revision, preservePosition = true) {
     const pdf = await loadingTask.promise;
     if (generation !== renderGeneration) return;
     documentHandle = pdf;
+    destinationCache.clear();
     scale = await calculateScale(pdf);
     zoomLabel.textContent = `${Math.round(scale * 100)}%`;
     pageCount.textContent = String(pdf.numPages);
@@ -216,8 +324,8 @@ function showForward(position) {
 async function inverseSearch(event) {
   if (!event.ctrlKey) return;
   event.preventDefault();
-  const page = event.currentTarget.closest(".page");
-  const rect = event.currentTarget.getBoundingClientRect();
+  const page = event.currentTarget;
+  const rect = page.getBoundingClientRect();
   const pageScale = Number(page.dataset.scale);
   setStatus("Inverse SyncTeX…");
   try {
@@ -495,6 +603,8 @@ function handleKey(event) {
   else if (event.ctrlKey && event.key === "u") window.scrollBy({ top: -halfPage });
   else if (event.ctrlKey && event.key === "f") window.scrollBy({ top: fullPage });
   else if (event.ctrlKey && event.key === "b") window.scrollBy({ top: -fullPage });
+  else if (event.ctrlKey && event.key === "o") goBack();
+  else if (event.ctrlKey && event.key === "i") goForward();
   else if (event.key === "G") scrollToPage(documentHandle?.numPages || 1);
   else if (event.key === "g") {
     if (pendingG) {

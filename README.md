@@ -81,7 +81,11 @@ The viewer keeps focus-friendly Zathura-style controls:
 | `/`, `n` / `N`       | Search text and move through highlighted matches |
 | `r`                  | Reload the PDF                              |
 | `?` / `Escape`       | Open help, close an overlay, or clear search |
+| Click a link         | Follow a reference, citation, or URL        |
+| `Ctrl-o` / `Ctrl-i`  | Jump back or forward after following a link |
 | Ctrl-click           | Inverse SyncTeX                             |
+
+Links come from the PDF itself: load `hyperref` so references, citations, and URLs become clickable. Internal links jump to the target; URLs open in a new tab.
 
 ## Requirements
 
