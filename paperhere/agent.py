@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import mimetypes
 import os
@@ -22,6 +23,13 @@ from . import synctex
 
 
 MAX_REQUEST_SIZE = 1024 * 1024
+# Firefox closes connections that stay silent for 5 s after a network change
+# notification, and its EventSource treats that as fatal. Keep the stream
+# chatty enough to survive it.
+EVENT_PING_INTERVAL = 4.0
+# A browser that vanished without closing its socket must not pin a handler
+# thread, and its subscriber queue, forever.
+EVENT_WRITE_TIMEOUT = 30.0
 
 
 def find_main_tex(root: Path) -> Path | None:
@@ -146,14 +154,18 @@ class AgentState:
         with self._lock:
             subscribers = tuple(self._subscribers)
         for subscriber in subscribers:
-            try:
-                subscriber.put_nowait(event)
-            except queue.Full:
+            while True:
                 try:
-                    subscriber.get_nowait()
                     subscriber.put_nowait(event)
-                except queue.Empty:
-                    pass
+                    break
+                except queue.Full:
+                    # A stalled listener only needs the latest events. Retry
+                    # after dropping one so a concurrent broadcast cannot
+                    # raise out of here.
+                    try:
+                        subscriber.get_nowait()
+                    except queue.Empty:
+                        pass
 
     def forward(self, payload: dict[str, Any]) -> dict[str, Any]:
         pdf = self.inside_root(Path(str(payload["pdf"])), must_exist=True)
@@ -221,6 +233,8 @@ class AgentState:
 class PaperhereServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # PDF.js opens several range requests at once; do not drop their SYNs.
+    request_queue_size = 64
 
     def __init__(self, address: tuple[str, int], state: AgentState):
         self.state = state
@@ -327,13 +341,25 @@ class PaperhereHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         data = resource.read_bytes()
+        # Revalidate on every load so a viewer update is picked up by the next
+        # page refresh instead of an hour later, while still skipping the body
+        # for unchanged files.
+        etag = f'"{hashlib.sha1(data).hexdigest()}"'
+        offered = self.headers.get("If-None-Match", "")
+        if etag in [value.strip() for value in offered.split(",")]:
+            self.send_response(HTTPStatus.NOT_MODIFIED)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            return
         content_type = mimetypes.guess_type(relative)[0] or "application/octet-stream"
         if relative.endswith(".mjs"):
             content_type = "text/javascript"
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "public, max-age=3600")
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(data)
 
@@ -345,28 +371,40 @@ class PaperhereHandler(BaseHTTPRequestHandler):
             return
         pdf = Path(pdf_value)
         try:
-            size = pdf.stat().st_size
+            stream = pdf.open("rb")
+            size = os.fstat(stream.fileno()).st_size
+        except OSError:
+            self.send_error(HTTPStatus.NOT_FOUND, "PDF is not readable")
+            return
+        with stream:
             start, end = 0, size - 1
             response_status = HTTPStatus.OK
             range_header = self.headers.get("Range")
             if range_header and range_header.startswith("bytes="):
-                raw_start, raw_end = range_header[6:].split("-", 1)
-                if "," in raw_end or (not raw_start and not raw_end):
-                    raise ValueError
-                if not raw_start:
-                    suffix_length = int(raw_end)
-                    if suffix_length <= 0:
+                try:
+                    raw_start, raw_end = range_header[6:].split("-", 1)
+                    if "," in raw_end or (not raw_start and not raw_end):
                         raise ValueError
-                    start = max(0, size - suffix_length)
-                    end = size - 1
-                else:
-                    start = int(raw_start)
-                    end = int(raw_end) if raw_end else size - 1
-                if start < 0 or end < start or end >= size:
-                    raise ValueError
+                    if not raw_start:
+                        suffix_length = int(raw_end)
+                        if suffix_length <= 0:
+                            raise ValueError
+                        start = max(0, size - suffix_length)
+                        end = size - 1
+                    else:
+                        start = int(raw_start)
+                        end = int(raw_end) if raw_end else size - 1
+                    if start < 0 or end < start or end >= size:
+                        raise ValueError
+                except ValueError:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 response_status = HTTPStatus.PARTIAL_CONTENT
-            with pdf.open("rb") as stream:
-                length = end - start + 1
+            length = end - start + 1
+            try:
                 self.send_response(response_status)
                 self.send_header("Content-Type", "application/pdf")
                 self.send_header("Content-Length", str(length))
@@ -383,34 +421,33 @@ class PaperhereHandler(BaseHTTPRequestHandler):
                         break
                     self.wfile.write(chunk)
                     remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except OSError:
-            self.send_error(HTTPStatus.NOT_FOUND, "PDF is not readable")
-        except ValueError:
-            self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
-            self.send_header("Content-Range", f"bytes */{size}")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            except OSError:
+                # The browser abandoned the download (reload storm, aborted
+                # range request); there is nobody left to answer.
+                pass
 
     def _events(self) -> None:
         subscriber = self.server.state.subscribe()
+        self.connection.settimeout(EVENT_WRITE_TIMEOUT)
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "keep-alive")
         self.end_headers()
         try:
+            # Ask the browser to come back quickly after a dropped connection.
+            self.wfile.write(b"retry: 1000\n\n")
             initial = {"type": "status", **self.server.state.status()}
             self._write_event(initial)
             while True:
                 try:
-                    event = subscriber.get(timeout=15)
-                    self._write_event(event)
+                    event = subscriber.get(timeout=EVENT_PING_INTERVAL)
                 except queue.Empty:
-                    self.wfile.write(b": ping\n\n")
-                    self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+                    # A real event rather than an SSE comment, so the viewer
+                    # can tell a quiet connection from a dead one.
+                    event = {"type": "ping"}
+                self._write_event(event)
+        except OSError:
+            # Broken pipe, reset, or a peer that stopped reading.
             pass
         finally:
             self.server.state.unsubscribe(subscriber)
@@ -423,7 +460,10 @@ class PaperhereHandler(BaseHTTPRequestHandler):
 
 def _watch_pdf(state: AgentState, stopped: threading.Event) -> None:
     while not stopped.wait(0.5):
-        state.refresh_if_changed()
+        try:
+            state.refresh_if_changed()
+        except Exception as exc:  # noqa: BLE001 - the watcher must outlive surprises
+            print(f"paperhere-agent: PDF watcher error: {exc}", file=sys.stderr)
 
 
 def serve(args: argparse.Namespace) -> int:

@@ -17,6 +17,7 @@ const searchStatus = document.querySelector("#search-status");
 let documentHandle = null;
 let loadingTask = null;
 let revision = 0;
+let loadedRevision = -1;
 let scale = 1.25;
 let scaleMode = "width";
 let renderGeneration = 0;
@@ -31,6 +32,13 @@ const pageViewports = new Map();
 const measureContext = document.createElement("canvas").getContext("2d");
 let pendingG = false;
 let pendingGTimer = null;
+let events = null;
+let lastEventAt = 0;
+let reconnectTimer = null;
+let reconnectDelay = 1000;
+// The agent pings every 4 s; a much longer silence means the connection is
+// dead even when the browser has not noticed yet.
+const HEARTBEAT_TIMEOUT = 20000;
 
 function apiUrl(path) {
   const url = new URL(path, window.location.origin);
@@ -121,7 +129,13 @@ async function loadPdf(nextRevision = revision, preservePosition = true) {
   loading = true;
   setStatus("Loading PDF…");
   try {
-    if (loadingTask) await loadingTask.destroy();
+    const previous = loadingTask;
+    loadingTask = null;
+    // The old task is unusable either way; a failure while tearing it down
+    // must not keep every later reload from starting.
+    if (previous) await previous.destroy().catch(() => {});
+    // A reload requested while the teardown was pending owns the next load.
+    if (generation !== renderGeneration) return;
     loadingTask = getDocument({
       url: apiUrl(`/document.pdf?revision=${revision}`),
       cMapUrl: "/static/cmaps/",
@@ -137,10 +151,11 @@ async function loadPdf(nextRevision = revision, preservePosition = true) {
     viewer.replaceChildren();
     for (let number = 1; number <= pdf.numPages; number += 1) {
       await renderPage(pdf, number, generation);
+      if (generation !== renderGeneration) return;
     }
-    if (generation !== renderGeneration) return;
     restoreAnchor(anchor);
     updateCurrentPage();
+    loadedRevision = nextRevision;
     setStatus("Ready");
     loading = false;
     if (pendingForward) showForward(pendingForward);
@@ -508,22 +523,70 @@ function handleKey(event) {
   if (handled) event.preventDefault();
 }
 
-function connectEvents() {
-  const events = new EventSource(apiUrl("/events"));
-  events.onopen = () => setStatus("Connected");
-  events.onerror = () => setStatus("Reconnecting…", true);
-  events.onmessage = (message) => {
-    const event = JSON.parse(message.data);
-    if (event.type === "status") {
-      revision = event.revision;
-      if (event.pdfReady) void loadPdf(revision, false);
-      else showWaiting();
-    } else if (event.type === "reload") {
+function handleEvent(event) {
+  if (event.type === "status") {
+    revision = event.revision;
+    if (!event.pdfReady) {
+      showWaiting();
+    } else if (!documentHandle || event.revision !== loadedRevision) {
       void loadPdf(event.revision, true);
-    } else if (event.type === "forward") {
-      showForward(event);
+    } else {
+      // Reconnected while the rendered document is still current: keep the
+      // reading position instead of starting over at page 1.
+      setStatus("Ready");
     }
+  } else if (event.type === "reload") {
+    void loadPdf(event.revision, true);
+  } else if (event.type === "forward") {
+    showForward(event);
+  }
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectEvents();
+  }, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+}
+
+function connectEvents() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  events?.close();
+  const source = new EventSource(apiUrl("/events"));
+  events = source;
+  lastEventAt = Date.now();
+  source.onopen = () => {
+    if (source !== events) return;
+    reconnectDelay = 1000;
+    lastEventAt = Date.now();
+    setStatus("Connected");
   };
+  source.onerror = () => {
+    if (source !== events) return;
+    setStatus("Reconnecting…", true);
+    // Browsers retry dropped connections on their own, but give up for good
+    // when the request was aborted rather than reset. Firefox aborts
+    // connections that stayed silent for a few seconds after a network
+    // change, which used to leave the viewer on "Reconnecting…" forever.
+    if (source.readyState === EventSource.CLOSED) scheduleReconnect();
+  };
+  source.onmessage = (message) => {
+    if (source !== events) return;
+    lastEventAt = Date.now();
+    handleEvent(JSON.parse(message.data));
+  };
+}
+
+function checkConnection() {
+  if (!events) return;
+  const silent = Date.now() - lastEventAt > HEARTBEAT_TIMEOUT;
+  if (events.readyState === EventSource.CLOSED || silent) {
+    setStatus("Reconnecting…", true);
+    connectEvents();
+  }
 }
 
 document.querySelector("#previous").addEventListener("click", () => scrollToPage(currentPage() - 1));
@@ -545,5 +608,10 @@ window.addEventListener("scroll", updateCurrentPage, { passive: true });
 window.addEventListener("resize", () => {
   if (scaleMode !== "manual" && documentHandle) void loadPdf(revision, true);
 });
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) checkConnection();
+});
+window.addEventListener("online", checkConnection);
+setInterval(checkConnection, 5000);
 
 connectEvents();
