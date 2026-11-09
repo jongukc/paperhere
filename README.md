@@ -83,9 +83,10 @@ The viewer keeps focus-friendly Zathura-style controls:
 | `?` / `Escape`       | Open help, close an overlay, or clear search |
 | Click a link         | Follow a reference, citation, or URL        |
 | `Ctrl-o` / `Ctrl-i`  | Jump back or forward after following a link |
+| Back / Forward       | Browser or mouse buttons: same as `Ctrl-o` / `Ctrl-i` |
 | Ctrl-click           | Inverse SyncTeX                             |
 
-Links come from the PDF itself: load `hyperref` so references, citations, and URLs become clickable. Internal links jump to the target; URLs open in a new tab.
+Links come from the PDF itself: load `hyperref` so references, citations, and URLs become clickable. Internal links jump to the target; URLs open in a new tab. Each jump becomes a browser history entry, so the Back button on the mouse or in the browser returns to where you were, and the reading position survives a page refresh.
 
 ## Requirements
 

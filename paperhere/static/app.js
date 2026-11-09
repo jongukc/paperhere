@@ -31,8 +31,15 @@ let lastSearch = "";
 const pageViewports = new Map();
 const measureContext = document.createElement("canvas").getContext("2d");
 const destinationCache = new Map();
-const backPositions = [];
-const forwardPositions = [];
+// Following a link records the reading position in the browser history, so
+// the mouse and browser Back/Forward buttons return to it, as do Ctrl-o/Ctrl-i.
+// Each entry's state carries an anchor so it survives a reload; the map holds
+// the fresher position captured when an entry was last left.
+let historyIndex = 0;
+let historyTarget = 0;
+let historyMax = 0;
+const historyAnchors = new Map();
+let pendingAnchor = null;
 let pendingG = false;
 let pendingGTimer = null;
 let events = null;
@@ -186,10 +193,8 @@ async function followLink(pdf, dest) {
       setStatus("Link target not found", true);
       return;
     }
-    backPositions.push(captureAnchor());
-    forwardPositions.length = 0;
-    scrollToDestination(target);
-    setStatus(`Page ${target.page} (Ctrl-o goes back)`);
+    pushHistory(target);
+    setStatus(`Page ${target.page} (Back or Ctrl-o returns)`);
   } catch (error) {
     setStatus(String(error?.message || error), true);
   }
@@ -209,24 +214,84 @@ function scrollToDestination({ page: number, top }) {
   pageNumber.value = String(number);
 }
 
-function goBack() {
-  if (!backPositions.length) {
-    setStatus("No earlier position");
+function historyState(index, anchor) {
+  return { paperhere: { index, anchor } };
+}
+
+function initHistory() {
+  // The viewer restores positions itself: pages render after the load event,
+  // and an anchor survives a rebuilt or re-zoomed document where a pixel
+  // offset would not.
+  history.scrollRestoration = "manual";
+  const state = history.state?.paperhere;
+  if (state && Number.isInteger(state.index)) {
+    historyIndex = historyTarget = historyMax = state.index;
+    if (state.anchor) pendingAnchor = state.anchor;
+  } else {
+    history.replaceState(historyState(0, null), "");
+  }
+}
+
+function pushHistory(target) {
+  const origin = captureAnchor();
+  historyAnchors.set(historyIndex, origin);
+  history.replaceState(historyState(historyIndex, origin), "");
+  historyIndex += 1;
+  historyTarget = historyMax = historyIndex;
+  for (const index of [...historyAnchors.keys()]) {
+    if (index >= historyIndex) historyAnchors.delete(index);
+  }
+  scrollToDestination(target);
+  const arrived = captureAnchor();
+  historyAnchors.set(historyIndex, arrived);
+  history.pushState(historyState(historyIndex, arrived), "");
+}
+
+function handlePopState(event) {
+  const state = event.state?.paperhere;
+  if (!state || !Number.isInteger(state.index)) return;
+  if (documentHandle && !loading) historyAnchors.set(historyIndex, captureAnchor());
+  historyIndex = historyTarget = state.index;
+  historyMax = Math.max(historyMax, historyIndex);
+  const anchor = historyAnchors.get(historyIndex) || state.anchor;
+  if (!anchor) return;
+  if (!documentHandle || loading) {
+    pendingAnchor = anchor;
     return;
   }
-  forwardPositions.push(captureAnchor());
-  restoreAnchor(backPositions.pop());
+  restoreAnchor(anchor);
   updateCurrentPage();
 }
 
+// Keeps the current entry's stored position fresh so a reload (or a Back
+// press after one) lands where the reader actually was. Firefox discards
+// state written during pagehide, so this runs shortly after each scroll.
+let rememberTimer = null;
+function rememberPosition() {
+  clearTimeout(rememberTimer);
+  rememberTimer = setTimeout(() => {
+    if (documentHandle && !loading) history.replaceState(historyState(historyIndex, captureAnchor()), "");
+  }, 250);
+}
+
+function goBack() {
+  // Traversal is asynchronous; the target index keeps a repeated Ctrl-o from
+  // stepping past the viewer's own entries before popstate catches up.
+  if (historyTarget <= 0) {
+    setStatus("No earlier position");
+    return;
+  }
+  historyTarget -= 1;
+  history.back();
+}
+
 function goForward() {
-  if (!forwardPositions.length) {
+  if (historyTarget >= historyMax) {
     setStatus("No later position");
     return;
   }
-  backPositions.push(captureAnchor());
-  restoreAnchor(forwardPositions.pop());
-  updateCurrentPage();
+  historyTarget += 1;
+  history.forward();
 }
 
 async function loadPdf(nextRevision = revision, preservePosition = true) {
@@ -261,7 +326,10 @@ async function loadPdf(nextRevision = revision, preservePosition = true) {
       await renderPage(pdf, number, generation);
       if (generation !== renderGeneration) return;
     }
-    restoreAnchor(anchor);
+    // A position carried over from before a reload, or from a Back/Forward
+    // press during the rebuild, wins over the one captured at the start.
+    restoreAnchor(pendingAnchor || anchor);
+    pendingAnchor = null;
     updateCurrentPage();
     loadedRevision = nextRevision;
     setStatus("Ready");
@@ -715,6 +783,7 @@ searchInput.addEventListener("keydown", (event) => {
 });
 window.addEventListener("keydown", handleKey);
 window.addEventListener("scroll", updateCurrentPage, { passive: true });
+window.addEventListener("scroll", rememberPosition, { passive: true });
 window.addEventListener("resize", () => {
   if (scaleMode !== "manual" && documentHandle) void loadPdf(revision, true);
 });
@@ -722,6 +791,8 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) checkConnection();
 });
 window.addEventListener("online", checkConnection);
+window.addEventListener("popstate", handlePopState);
 setInterval(checkConnection, 5000);
 
+initHistory();
 connectEvents();
